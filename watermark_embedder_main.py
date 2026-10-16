@@ -18,8 +18,8 @@ Takes a photo/video file, overlays an AI watermark per UX specs,
 and saves the watermarked output file in a destination directory.
 
 Usage:
-    blaze run //corp/gtech/ads/infrastructure/gta_ai_labelling:ai_watermark_tool
-        -- --input /path/to/sample.jpg --output_dir ./results_folder
+    python watermark_embedder_main.py --input /path/to/sample.jpg
+        --output_dir ./results_folder
 """
 
 from collections.abc import Sequence
@@ -70,13 +70,11 @@ _VIDEO_EXTENSIONS = frozenset(
 
 
 def _resolve_path(file_path: str) -> str:
-  """Resolves a file path, taking into account build working directory."""
+  """Resolves a file path to an absolute path."""
   if not file_path:
     return file_path
   if os.path.isabs(file_path):
     return file_path
-  if 'BUILD_WORKING_DIRECTORY' in os.environ:
-    return os.path.join(os.environ['BUILD_WORKING_DIRECTORY'], file_path)
   return os.path.abspath(file_path)
 
 

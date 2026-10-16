@@ -14,25 +14,20 @@
 
 """AI Watermark Embedding Library.
 
-Adds an AI watermark label to photos and videos based on Google UX specs:
-https://docs.google.com/presentation/d/1FST3pfVDu5zb452aIeHDxd7kXdMwA_Nnco_i7zPiPXo/edit?slide=id.g3f3ca05cc0a_0_0#slide=id.g3f3ca05cc0a_0_0
+Adds an AI watermark label to photos and videos based on Google UX specs.
 """
 
 import glob
-import io
-import json
 import os
-import subprocess
 import tempfile
-from typing import Any, Optional, Tuple, Union
+from typing import Any, Optional, Union
 
 from absl import logging
 import cv2
+import ffmpeg
 from PIL import Image
 from PIL import ImageDraw
 from PIL import ImageFont
-
-from google3.pyglib import resources
 
 # Supported file extensions
 _IMAGE_EXTENSIONS = frozenset(
@@ -43,78 +38,32 @@ _VIDEO_EXTENSIONS = frozenset(
 )
 
 
-def _get_ffmpeg_path() -> str:
-  """Resolves the path to the ffmpeg binary."""
-  try:
-    return resources.GetResourceFilename(
-        'google3/video/vidproc/ffmpeg/sandboxable_ffmpeg'
-    )
-  except (IOError, ValueError):
-    try:
-      return resources.GetResourceFilename(
-          'google3/video/vidproc/ffmpeg/ffmpeg'
-      )
-    except (IOError, ValueError):
-      try:
-        return resources.GetResourceFilename(
-            'google3/third_party/ffmpeg/ffmpeg'
-        )
-      except (IOError, ValueError):
-        return 'ffmpeg'
-
-
-def _get_ffprobe_path() -> str:
-  """Resolves the path to the ffprobe binary."""
-  try:
-    return resources.GetResourceFilename(
-        'google3/video/vidproc/ffmpeg/sandboxable_ffprobe'
-    )
-  except (IOError, ValueError):
-    try:
-      return resources.GetResourceFilename(
-          'google3/video/vidproc/ffmpeg/ffprobe'
-      )
-    except (IOError, ValueError):
-      try:
-        return resources.GetResourceFilename(
-            'google3/third_party/ffmpeg/ffprobe'
-        )
-      except (IOError, ValueError):
-        return 'ffprobe'
-
-
 def _get_watermark_font(font_size: int = 12) -> Any:
   """Loads Roboto Medium font for the AI watermark badge."""
-  try:
-    font_bytes = resources.GetResource(
-        'google3/third_party/roboto/unhinted/Roboto-Medium.ttf'
-    )
-    return ImageFont.truetype(io.BytesIO(font_bytes), font_size)
-  except (OSError, ValueError):
-    pass
-
-  possible_font_paths = [
-      'third_party/roboto/unhinted/Roboto-Medium.ttf',
-      'third_party/googlefonts/api/apache/roboto/Roboto-Medium.ttf',
-      '/usr/share/fonts/truetype/roboto/unhinted/Roboto-Medium.ttf',
-      '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf',
+  font_names = [
+      'Roboto-Medium.ttf',
+      'LiberationSans-Bold.ttf',
+      'LiberationSans-Regular.ttf',
+      'DejaVuSans-Bold.ttf',
   ]
 
-  for path in possible_font_paths:
-    if os.path.exists(path):
-      try:
-        return ImageFont.truetype(path, font_size)
-      except (OSError, ValueError):
-        pass
-  return ImageFont.load_default()
+  for font_name in font_names:
+    try:
+      return ImageFont.truetype(font_name, font_size)
+    except (OSError, ValueError):
+      pass
+  try:
+    return ImageFont.load_default(size=font_size)
+  except TypeError:
+    return ImageFont.load_default()
 
 
 def _create_ai_watermark_badge(
     text: str = 'AI',
     base_font_size: int = 12,
     scale: float = 1.0,
-    text_color: Tuple[int, int, int, int] = (255, 255, 255, 255),
-    bg_color: Tuple[int, int, int, int] = (0, 0, 0, 153),
+    text_color: tuple[int, int, int, int] = (255, 255, 255, 255),
+    bg_color: tuple[int, int, int, int] = (0, 0, 0, 153),
 ) -> Image.Image:
   """Creates an RGBA PIL Image containing the AI watermark badge.
 
@@ -225,7 +174,7 @@ def _calculate_watermark_position(
     badge_h: int,
     position: str = 'top-left',
     margin: int = 12,
-) -> Tuple[int, int]:
+) -> tuple[int, int]:
   """Calculates x, y coordinates for positioning the watermark badge."""
   pos_lower = position.lower()
   if pos_lower == 'top-left':
@@ -373,33 +322,21 @@ def _get_video_fps(video_path: str) -> float:
           video_path,
       )
 
-  cmd = [
-      _get_ffprobe_path(),
-      '-v',
-      'error',
-      '-select_streams',
-      'v:0',
-      '-show_entries',
-      'stream=r_frame_rate',
-      '-of',
-      'json',
-      video_path,
-  ]
   data = None
   try:
-    res = subprocess.run(cmd, capture_output=True, text=True, check=True)
-    data = json.loads(res.stdout)
-  except (
-      OSError,
-      json.JSONDecodeError,
-      subprocess.CalledProcessError,
-  ) as exc:
+    data = ffmpeg.probe(video_path)
+  except (OSError, ffmpeg.Error) as exc:
     logging.warning(
-        'Failed to probe video FPS with ffprobe for %s: %s', video_path, exc
+        'Failed to probe video FPS with ffmpeg.probe for %s: %s',
+        video_path,
+        exc,
     )
 
-  if data and 'streams' in data and data['streams']:
-    stream = data['streams'][0]
+  if isinstance(data, dict) and data.get('streams'):
+    video_streams = [
+        s for s in data['streams'] if s.get('codec_type') == 'video'
+    ]
+    stream = video_streams[0] if video_streams else data['streams'][0]
     rate_str = stream.get('r_frame_rate', '')
     if rate_str:
       try:
@@ -443,9 +380,8 @@ def embed_watermark_video(
       (default/recommended), 'top-right', 'bottom-left', 'bottom-right'.
     margin: Distance in pixels from each frame edge to the badge. Defaults to
       12.
-    scale: Optional manual scaling factor. When None, the badge is
-      automatically scaled based on video resolution relative to a 480p
-      baseline.
+    scale: Optional manual scaling factor. When None, the badge is automatically
+      scaled based on video resolution relative to a 480p baseline.
 
   Returns:
     Path to the watermarked output video file.
@@ -473,24 +409,14 @@ def embed_watermark_video(
   # Use FFmpeg frame extraction and watermarking
   with tempfile.TemporaryDirectory() as tmp_dir:
     extract_pattern = os.path.join(tmp_dir, 'frame_%06d.png')
-    extract_cmd = [
-        _get_ffmpeg_path(),
-        '-y',
-        '-i',
-        input_path,
-        '-vsync',
-        '0',
+    extract_stream = ffmpeg.output(
+        ffmpeg.input(input_path),
         extract_pattern,
-    ]
+        vsync='0',
+    )
     try:
-      subprocess.run(
-          extract_cmd, capture_output=True, text=True, check=True
-      )
-    except subprocess.CalledProcessError as exc:
-      raise ValueError(
-          f'Unable to process video file: {input_path}. Error: {exc.stderr}'
-      ) from exc
-    except OSError as exc:
+      ffmpeg.run(extract_stream, overwrite_output=True, quiet=True)
+    except (ffmpeg.Error, OSError) as exc:
       raise ValueError(
           f'Unable to process video file: {input_path}'
       ) from exc
@@ -512,34 +438,19 @@ def embed_watermark_video(
         ) from exc
 
     output_pattern = os.path.join(tmp_dir, 'frame_%06d.png')
-    encode_cmd = [
-        _get_ffmpeg_path(),
-        '-y',
-        '-framerate',
-        str(fps),
-        '-i',
-        output_pattern,
-        '-i',
-        input_path,
-        '-map',
-        '0:v',
-        '-map',
-        '1:a?',
-        '-c:v',
-        'libx264',
-        '-c:a',
-        'copy',
-        '-pix_fmt',
-        'yuv420p',
+    frames_input = ffmpeg.input(output_pattern, framerate=fps)
+    original_input = ffmpeg.input(input_path)
+    encode_stream = ffmpeg.output(
+        frames_input.video,
+        original_input['a?'],
         output_path,
-    ]
+        vcodec='libx264',
+        acodec='copy',
+        pix_fmt='yuv420p',
+    )
     try:
-      subprocess.run(encode_cmd, capture_output=True, text=True, check=True)
-    except subprocess.CalledProcessError as exc:
-      raise ValueError(
-          f'Unable to process video file: {input_path}. Error: {exc.stderr}'
-      ) from exc
-    except OSError as exc:
+      ffmpeg.run(encode_stream, overwrite_output=True, quiet=True)
+    except (ffmpeg.Error, OSError) as exc:
       raise ValueError(
           f'Unable to process video file: {input_path}'
       ) from exc

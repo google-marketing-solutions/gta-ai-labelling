@@ -14,10 +14,8 @@
 
 """Tests for AI Watermark Embedding Library."""
 
-from collections.abc import Sequence
 import os
 import shutil
-import subprocess
 import tempfile
 from typing import Any
 from unittest import mock
@@ -25,55 +23,27 @@ from unittest import mock
 from absl.testing import absltest
 from absl.testing import parameterized
 import cv2
+import ffmpeg
 from PIL import Image
 
 import watermark_embedder
 
 
-def _mock_subprocess_run_side_effect(
-    args: Sequence[str], **_kwargs: Any
-) -> subprocess.CompletedProcess[str]:
-  exe = args[0]
-  if 'ffprobe' in exe or 'sandboxable_ffprobe' in exe:
-    return subprocess.CompletedProcess(
-        args=args,
-        returncode=0,
-        stdout='{"streams": [{"r_frame_rate": "30/1"}]}',
-        stderr='',
-    )
-  if ('ffmpeg' in exe or 'sandboxable_ffmpeg' in exe) and '-vsync' in args:
-    out_pattern = args[-1]
-    frame_path = out_pattern % 1
+def _fake_ffmpeg_run(
+    stream_spec: Any,
+    overwrite_output: bool = False,
+    **_kwargs: Any,
+) -> tuple[bytes, bytes]:
+  args = ffmpeg.get_args(stream_spec, overwrite_output=overwrite_output)
+  out_arg = args[-2] if overwrite_output and args[-1] == '-y' else args[-1]
+  if '-vsync' in args:
+    frame_path = out_arg % 1
     img = Image.new('RGB', (320, 240), color=(100, 120, 200))
     img.save(frame_path, format='PNG')
-  elif ('ffmpeg' in exe or 'sandboxable_ffmpeg' in exe) and '-pix_fmt' in args:
-    out_path = args[-1]
-    with open(out_path, 'wb') as f:
+  else:
+    with open(out_arg, 'wb') as f:
       f.write(b'fake_video_contents')
-  return subprocess.CompletedProcess(
-      args=args, returncode=0, stdout='', stderr=''
-  )
-
-
-_COMPLETED_PROCESS_SPEC = subprocess.CompletedProcess(
-    args=[], returncode=0, stdout='', stderr=''
-)
-
-
-class _VideoCaptureSpec:
-  """Spec for cv2.VideoCapture to enable autospec validation."""
-
-  def isOpened(self) -> bool:
-    return True
-
-  def read(self) -> tuple[bool, Any]:
-    return True, None
-
-  def get(self, prop: int) -> float:
-    return 0.0
-
-  def release(self) -> None:
-    pass
+  return b'', b''
 
 
 class WatermarkEmbedderTest(parameterized.TestCase):
@@ -145,7 +115,6 @@ class WatermarkEmbedderTest(parameterized.TestCase):
       ('webp', 'sample.webp', 'output.webp'),
   )
   def test_embed_watermark_image(self, input_name, output_name):
-    # Create test input image
     input_image_path = os.path.join(self.test_dir, input_name)
     img = Image.new('RGB', (640, 480), color=(100, 150, 200))
     img.save(input_image_path)
@@ -161,7 +130,6 @@ class WatermarkEmbedderTest(parameterized.TestCase):
     self.assertTrue(os.path.exists(output_file))
     self.assertGreater(os.path.getsize(output_file), 0)
 
-    # Verify watermarked image dimensions and content
     with Image.open(output_file) as out_img:
       self.assertEqual(out_img.size, (640, 480))
 
@@ -173,25 +141,21 @@ class WatermarkEmbedderTest(parameterized.TestCase):
           nonexistent, output_path=output_file
       )
 
-  @mock.patch.object(cv2, 'VideoCapture', create=True)
-  @mock.patch.object(subprocess, 'run')
-  def test_embed_watermark_video(self, mock_run, mock_capture):
-    mock_run.side_effect = _mock_subprocess_run_side_effect
-
-    # Mock cv2.VideoCapture so that video reading verification logic actually
-    # runs
-    mock_cap = mock.create_autospec(
-        _VideoCaptureSpec, instance=True, spec_set=True
+  def test_embed_watermark_video(self):
+    self.enter_context(
+        mock.patch.object(cv2, 'VideoCapture', return_value=None, create=True)
     )
-    mock_cap.isOpened.return_value = True
-    mock_cap.read.side_effect = [
-        (True, None),
-        (True, None),
-        (False, None),
-    ]
-    mock_capture.return_value = mock_cap
+    mock_probe = self.enter_context(
+        mock.patch.object(ffmpeg, 'probe', autospec=True, spec_set=True)
+    )
+    mock_run = self.enter_context(
+        mock.patch.object(ffmpeg, 'run', autospec=True, spec_set=True)
+    )
+    mock_probe.return_value = {
+        'streams': [{'codec_type': 'video', 'r_frame_rate': '30/1'}]
+    }
+    mock_run.side_effect = _fake_ffmpeg_run
 
-    # Create a dummy input video file in self.test_dir
     input_video_path = os.path.join(self.test_dir, 'dummy_video.mp4')
     with open(input_video_path, 'wb') as f:
       f.write(b'dummy_video_contents')
@@ -206,19 +170,8 @@ class WatermarkEmbedderTest(parameterized.TestCase):
     self.assertEqual(result, output_file)
     self.assertTrue(os.path.exists(output_file))
     self.assertGreater(os.path.getsize(output_file), 0)
-
-    # Verify video can be read if VideoCapture attribute is present
-    if hasattr(cv2, 'VideoCapture'):
-      cap = cv2.VideoCapture(output_file)
-      if cap is not None and cap.isOpened():
-        read_frames = 0
-        while True:
-          ret, _ = cap.read()
-          if not ret:
-            break
-          read_frames += 1
-        cap.release()
-        self.assertGreater(read_frames, 0)
+    mock_probe.assert_called_once_with(input_video_path)
+    self.assertEqual(mock_run.call_count, 2)
 
   def test_embed_watermark_image_unsupported_format_raises_error(self):
     unsupported_file = os.path.join(self.test_dir, 'sample.txt')
@@ -277,24 +230,14 @@ class WatermarkEmbedderTest(parameterized.TestCase):
           input_file, output_path=output_file
       )
 
-  @mock.patch.object(cv2, 'VideoCapture', create=True)
-  @mock.patch.object(subprocess, 'run')
-  def test_embed_watermark_video_unresolvable_fps_raises_error(
-      self, mock_run, mock_capture
-  ):
-    mock_cap = mock.create_autospec(
-        _VideoCaptureSpec, instance=True, spec_set=True
+  def test_embed_watermark_video_unresolvable_fps_raises_error(self):
+    self.enter_context(
+        mock.patch.object(cv2, 'VideoCapture', return_value=None, create=True)
     )
-    mock_cap.isOpened.return_value = False
-    mock_capture.return_value = mock_cap
-
-    mock_completed_proc = mock.create_autospec(
-        _COMPLETED_PROCESS_SPEC, spec_set=True
+    mock_probe = self.enter_context(
+        mock.patch.object(ffmpeg, 'probe', autospec=True, spec_set=True)
     )
-    mock_completed_proc.returncode = 0
-    mock_completed_proc.stdout = ''
-    mock_completed_proc.stderr = ''
-    mock_run.return_value = mock_completed_proc
+    mock_probe.return_value = {'streams': []}
 
     input_video_path = os.path.join(self.test_dir, 'dummy_video.mp4')
     with open(input_video_path, 'wb') as f:
