@@ -17,13 +17,10 @@
 Adds an AI watermark label to photos and videos based on Google UX specs.
 """
 
-import glob
 import os
 import tempfile
 from typing import Any, Optional, Union
 
-from absl import logging
-import cv2
 import ffmpeg
 from PIL import Image
 from PIL import ImageDraw
@@ -290,72 +287,48 @@ def embed_watermark_image(
   return watermarked_img
 
 
-def _get_video_fps(video_path: str) -> float:
-  """Probes and returns the FPS (frames per second) of a video file.
+def _get_video_info(video_path: str) -> tuple[int, int, bool]:
+  """Probes video dimensions and audio presence using ffmpeg.probe.
 
   Args:
     video_path: Path to the video file.
 
   Returns:
-    The frame rate as a float.
+    A tuple of (width, height, has_audio).
 
   Raises:
-    ValueError: If unable to determine video FPS.
+    ValueError: If unable to probe the video or determine its dimensions.
   """
-  if hasattr(cv2, 'VideoCapture'):
-    fps = None
-    try:
-      cap = cv2.VideoCapture(video_path)
-      if cap is not None and cap.isOpened():
-        fps = float(cap.get(cv2.CAP_PROP_FPS))
-        cap.release()
-    except (OSError, ValueError, TypeError, AttributeError, cv2.error) as exc:
-      logging.warning(
-          'Failed to probe video FPS with OpenCV for %s: %s', video_path, exc
-      )
-    if fps is not None:
-      if fps > 0:
-        return fps
-      logging.warning(
-          'OpenCV VideoCapture returned non-positive FPS (%s) for %s.',
-          fps,
-          video_path,
-      )
-
-  data = None
   try:
-    data = ffmpeg.probe(video_path)
-  except (OSError, ffmpeg.Error) as exc:
-    logging.warning(
-        'Failed to probe video FPS with ffmpeg.probe for %s: %s',
-        video_path,
-        exc,
+    probe_data = ffmpeg.probe(video_path)
+  except (ffmpeg.Error, OSError) as exc:
+    raise ValueError(f'Unable to probe video file: {video_path}') from exc
+
+  streams = (
+      probe_data.get('streams', []) if isinstance(probe_data, dict) else []
+  )
+  video_stream = next(
+      (s for s in streams if s.get('codec_type') == 'video'),
+      None,
+  )
+  if not video_stream:
+    raise ValueError(f'No video stream found in: {video_path}')
+
+  try:
+    width = int(video_stream['width'])
+    height = int(video_stream['height'])
+  except (KeyError, TypeError, ValueError) as exc:
+    raise ValueError(
+        f'Unable to determine dimensions for video: {video_path}'
+    ) from exc
+
+  if width <= 0 or height <= 0:
+    raise ValueError(
+        f'Invalid video dimensions ({width}x{height}) for: {video_path}'
     )
 
-  if isinstance(data, dict) and data.get('streams'):
-    video_streams = [
-        s for s in data['streams'] if s.get('codec_type') == 'video'
-    ]
-    stream = video_streams[0] if video_streams else data['streams'][0]
-    rate_str = stream.get('r_frame_rate', '')
-    if rate_str:
-      try:
-        if '/' in rate_str:
-          num, den = rate_str.split('/')
-          fps = float(num) / float(den)
-        else:
-          fps = float(rate_str)
-        if fps > 0:
-          return fps
-      except (ValueError, ZeroDivisionError) as exc:
-        logging.warning(
-            'Failed to parse frame rate "%s" for %s: %s',
-            rate_str,
-            video_path,
-            exc,
-        )
-
-  raise ValueError(f'Unable to determine FPS for video: {video_path}')
+  has_audio = any(s.get('codec_type') == 'audio' for s in streams)
+  return width, height, has_audio
 
 
 def embed_watermark_video(
@@ -367,9 +340,8 @@ def embed_watermark_video(
 ) -> str:
   """Embeds an AI watermark badge on a video per YouTube UX specifications.
 
-  Extracts video frames using FFmpeg, overlays the AI watermark badge on each
-  frame, and re-encodes the final output video with original audio streams
-  preserved.
+  Generates a transparent AI watermark badge image and overlays it onto the
+  video stream using FFmpeg while preserving original audio streams.
 
   Args:
     input_path: Path to the input video file (supported formats: .mp4, .avi,
@@ -389,70 +361,71 @@ def embed_watermark_video(
   Raises:
     FileNotFoundError: If `input_path` does not exist.
     ValueError: If `input_path` or `output_path` has an unsupported video file
-      extension, or if FFmpeg frame extraction, watermarking, or video
-      re-encoding fails.
+      extension, or if FFmpeg probing or video overlay encoding fails.
   """
   if not os.path.exists(input_path):
     raise FileNotFoundError(f'Video file not found: {input_path}')
 
-  ext = os.path.splitext(input_path)[1].lower()
-  if ext not in _VIDEO_EXTENSIONS:
-    raise ValueError(f'Unsupported video file format: {ext}')
+  extension = os.path.splitext(input_path)[1].lower()
+  if extension not in _VIDEO_EXTENSIONS:
+    raise ValueError(f'Unsupported video file format: {extension}')
 
-  out_ext = os.path.splitext(output_path)[1].lower()
-  if out_ext not in _VIDEO_EXTENSIONS:
-    raise ValueError(f'Unsupported output video format: {out_ext}')
+  output_extension = os.path.splitext(output_path)[1].lower()
+  if output_extension not in _VIDEO_EXTENSIONS:
+    raise ValueError(f'Unsupported output video format: {output_extension}')
 
   os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
-  fps = _get_video_fps(input_path)
+  width, height, has_audio = _get_video_info(input_path)
 
-  # Use FFmpeg frame extraction and watermarking
+  calc_scale = _compute_scale_factor(width, height, scale)
+  badge = _create_ai_watermark_badge(scale=calc_scale)
+  margin_scaled = int(margin * calc_scale)
+  x, y = _calculate_watermark_position(
+      width,
+      height,
+      badge.width,
+      badge.height,
+      position=position,
+      margin=margin_scaled,
+  )
+
   with tempfile.TemporaryDirectory() as tmp_dir:
-    extract_pattern = os.path.join(tmp_dir, 'frame_%06d.png')
-    extract_stream = ffmpeg.output(
-        ffmpeg.input(input_path),
-        extract_pattern,
-        vsync='0',
-    )
+    badge_path = os.path.join(tmp_dir, 'watermark_badge.png')
+    badge.save(badge_path, format='PNG')
+
+    video_input = ffmpeg.input(input_path)
+    badge_input = ffmpeg.input(badge_path)
+    overlaid_video = video_input.video.overlay(badge_input, x=x, y=y)
+
+    if has_audio:
+      stream = ffmpeg.output(
+          overlaid_video,
+          video_input.audio,
+          output_path,
+          vcodec='libx264',
+          acodec='copy',
+          pix_fmt='yuv420p',
+      )
+    else:
+      stream = ffmpeg.output(
+          overlaid_video,
+          output_path,
+          vcodec='libx264',
+          pix_fmt='yuv420p',
+      )
+
     try:
-      ffmpeg.run(extract_stream, overwrite_output=True, quiet=True)
+      ffmpeg.run(stream, overwrite_output=True, quiet=True)
     except (ffmpeg.Error, OSError) as exc:
-      raise ValueError(
-          f'Unable to process video file: {input_path}'
-      ) from exc
-
-    frame_files = sorted(glob.glob(os.path.join(tmp_dir, 'frame_*.png')))
-
-    for frame_file in frame_files:
-      try:
-        embed_watermark_image(
-            image_input=frame_file,
-            output_path=frame_file,
-            position=position,
-            margin=margin,
-            scale=scale,
+      error_detail = ''
+      if isinstance(exc, ffmpeg.Error) and exc.stderr:
+        error_detail = (
+            exc.stderr.decode('utf-8', errors='replace')
+            if isinstance(exc.stderr, bytes)
+            else str(exc.stderr)
         )
-      except (OSError, ValueError) as exc:
-        raise ValueError(
-            f'Unable to process video file: {input_path}'
-        ) from exc
-
-    output_pattern = os.path.join(tmp_dir, 'frame_%06d.png')
-    frames_input = ffmpeg.input(output_pattern, framerate=fps)
-    original_input = ffmpeg.input(input_path)
-    encode_stream = ffmpeg.output(
-        frames_input.video,
-        original_input['a?'],
-        output_path,
-        vcodec='libx264',
-        acodec='copy',
-        pix_fmt='yuv420p',
-    )
-    try:
-      ffmpeg.run(encode_stream, overwrite_output=True, quiet=True)
-    except (ffmpeg.Error, OSError) as exc:
       raise ValueError(
-          f'Unable to process video file: {input_path}'
+          f'Unable to process video file: {input_path}. {error_detail}'.strip()
       ) from exc
 
     if os.path.exists(output_path) and os.path.getsize(output_path) > 0:

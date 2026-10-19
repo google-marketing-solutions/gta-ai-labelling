@@ -22,7 +22,6 @@ from unittest import mock
 
 from absl.testing import absltest
 from absl.testing import parameterized
-import cv2
 import ffmpeg
 from PIL import Image
 
@@ -35,14 +34,9 @@ def _fake_ffmpeg_run(
     **_kwargs: Any,
 ) -> tuple[bytes, bytes]:
   args = ffmpeg.get_args(stream_spec, overwrite_output=overwrite_output)
-  out_arg = args[-2] if overwrite_output and args[-1] == '-y' else args[-1]
-  if '-vsync' in args:
-    frame_path = out_arg % 1
-    img = Image.new('RGB', (320, 240), color=(100, 120, 200))
-    img.save(frame_path, format='PNG')
-  else:
-    with open(out_arg, 'wb') as f:
-      f.write(b'fake_video_contents')
+  out_path = args[-2] if overwrite_output and args[-1] == '-y' else args[-1]
+  with open(out_path, 'wb') as f:
+    f.write(b'fake_video_contents')
   return b'', b''
 
 
@@ -141,19 +135,31 @@ class WatermarkEmbedderTest(parameterized.TestCase):
           nonexistent, output_path=output_file
       )
 
-  def test_embed_watermark_video(self):
-    self.enter_context(
-        mock.patch.object(cv2, 'VideoCapture', return_value=None, create=True)
-    )
+  @parameterized.named_parameters(
+      dict(
+          testcase_name='with_audio',
+          streams=[
+              {'codec_type': 'video', 'width': 640, 'height': 480},
+              {'codec_type': 'audio'},
+          ],
+          expect_audio_copy=True,
+      ),
+      dict(
+          testcase_name='video_only',
+          streams=[
+              {'codec_type': 'video', 'width': 640, 'height': 480},
+          ],
+          expect_audio_copy=False,
+      ),
+  )
+  def test_embed_watermark_video(self, streams, expect_audio_copy):
     mock_probe = self.enter_context(
         mock.patch.object(ffmpeg, 'probe', autospec=True, spec_set=True)
     )
     mock_run = self.enter_context(
         mock.patch.object(ffmpeg, 'run', autospec=True, spec_set=True)
     )
-    mock_probe.return_value = {
-        'streams': [{'codec_type': 'video', 'r_frame_rate': '30/1'}]
-    }
+    mock_probe.return_value = {'streams': streams}
     mock_run.side_effect = _fake_ffmpeg_run
 
     input_video_path = os.path.join(self.test_dir, 'dummy_video.mp4')
@@ -171,14 +177,19 @@ class WatermarkEmbedderTest(parameterized.TestCase):
     self.assertTrue(os.path.exists(output_file))
     self.assertGreater(os.path.getsize(output_file), 0)
     mock_probe.assert_called_once_with(input_video_path)
-    self.assertEqual(mock_run.call_count, 2)
+    mock_run.assert_called_once()
+
+    stream_arg = mock_run.call_args.args[0]
+    compiled_args = ffmpeg.get_args(stream_arg, overwrite_output=True)
+    self.assertIn('-filter_complex', compiled_args)
+    self.assertEqual('-acodec' in compiled_args, expect_audio_copy)
 
   def test_embed_watermark_image_unsupported_format_raises_error(self):
     unsupported_file = os.path.join(self.test_dir, 'sample.txt')
     with open(unsupported_file, 'w') as f:
       f.write('sample content')
     output_file = os.path.join(self.test_dir, 'output.txt')
-    with self.assertRaises(ValueError):
+    with self.assertRaisesRegex(ValueError, 'Unsupported image file format'):
       watermark_embedder.embed_watermark_image(
           unsupported_file, output_path=output_file
       )
@@ -197,7 +208,7 @@ class WatermarkEmbedderTest(parameterized.TestCase):
   def test_embed_watermark_image_unsupported_output_format_raises_error(self):
     img = Image.new('RGB', (640, 480))
     output_file = os.path.join(self.test_dir, 'output.txt')
-    with self.assertRaises(ValueError):
+    with self.assertRaisesRegex(ValueError, 'Unsupported output image format'):
       watermark_embedder.embed_watermark_image(
           img, output_path=output_file
       )
@@ -215,7 +226,7 @@ class WatermarkEmbedderTest(parameterized.TestCase):
     with open(unsupported_file, 'w') as f:
       f.write('sample content')
     output_file = os.path.join(self.test_dir, 'output.mp4')
-    with self.assertRaises(ValueError):
+    with self.assertRaisesRegex(ValueError, 'Unsupported video file format'):
       watermark_embedder.embed_watermark_video(
           unsupported_file, output_path=output_file
       )
@@ -225,15 +236,12 @@ class WatermarkEmbedderTest(parameterized.TestCase):
     with open(input_file, 'wb') as f:
       f.write(b'video content')
     output_file = os.path.join(self.test_dir, 'output.txt')
-    with self.assertRaises(ValueError):
+    with self.assertRaisesRegex(ValueError, 'Unsupported output video format'):
       watermark_embedder.embed_watermark_video(
           input_file, output_path=output_file
       )
 
-  def test_embed_watermark_video_unresolvable_fps_raises_error(self):
-    self.enter_context(
-        mock.patch.object(cv2, 'VideoCapture', return_value=None, create=True)
-    )
+  def test_embed_watermark_video_probe_failure_raises_error(self):
     mock_probe = self.enter_context(
         mock.patch.object(ffmpeg, 'probe', autospec=True, spec_set=True)
     )
@@ -244,7 +252,30 @@ class WatermarkEmbedderTest(parameterized.TestCase):
       f.write(b'dummy_video_contents')
 
     output_file = os.path.join(self.test_dir, 'output_video.mp4')
-    with self.assertRaises(ValueError):
+    with self.assertRaisesRegex(ValueError, 'No video stream found'):
+      watermark_embedder.embed_watermark_video(
+          input_path=input_video_path,
+          output_path=output_file,
+      )
+
+  def test_embed_watermark_video_encode_failure_raises_error(self):
+    mock_probe = self.enter_context(
+        mock.patch.object(ffmpeg, 'probe', autospec=True, spec_set=True)
+    )
+    mock_run = self.enter_context(
+        mock.patch.object(ffmpeg, 'run', autospec=True, spec_set=True)
+    )
+    mock_probe.return_value = {
+        'streams': [{'codec_type': 'video', 'width': 640, 'height': 480}]
+    }
+    mock_run.side_effect = ffmpeg.Error('ffmpeg', b'', b'encode failed')
+
+    input_video_path = os.path.join(self.test_dir, 'dummy_video.mp4')
+    with open(input_video_path, 'wb') as f:
+      f.write(b'dummy_video_contents')
+
+    output_file = os.path.join(self.test_dir, 'output_video.mp4')
+    with self.assertRaisesRegex(ValueError, 'Unable to process video file'):
       watermark_embedder.embed_watermark_video(
           input_path=input_video_path,
           output_path=output_file,

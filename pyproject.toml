@@ -26,7 +26,6 @@ license = {text = "Apache-2.0"}
 dependencies = [
     "absl-py",
     "ffmpeg-python",
-    "opencv-python-headless",
     "Pillow",
 ]
 
