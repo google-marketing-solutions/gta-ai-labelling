@@ -19,7 +19,7 @@ Adds an AI watermark label to photos and videos based on Google UX specs.
 
 import os
 import tempfile
-from typing import Any, Optional, Union
+from typing import Any, Optional, Union, overload
 
 import ffmpeg
 from PIL import Image
@@ -96,8 +96,8 @@ def _create_ai_watermark_badge(
   dummy_img = Image.new('RGBA', (1, 1))
   dummy_draw = ImageDraw.Draw(dummy_img)
   bbox = dummy_draw.textbbox((0, 0), text, font=font)
-  text_w = bbox[2] - bbox[0]
-  text_h = bbox[3] - bbox[1]
+  text_w = int(bbox[2] - bbox[0])
+  text_h = int(bbox[3] - bbox[1])
 
   content_w = icon_size + gap + text_w
   content_h = max(icon_size, text_h)
@@ -195,6 +195,39 @@ def _calculate_watermark_position(
   x = max(0, min(x, canvas_w - badge_w))
   y = max(0, min(y, canvas_h - badge_h))
   return x, y
+
+
+@overload
+def embed_watermark_image(
+    image_input: Union[str, Image.Image],
+    output_path: str,
+    position: str = ...,
+    margin: int = ...,
+    scale: Optional[float] = ...,
+) -> str:
+  ...
+
+
+@overload
+def embed_watermark_image(
+    image_input: Image.Image,
+    output_path: None = ...,
+    position: str = ...,
+    margin: int = ...,
+    scale: Optional[float] = ...,
+) -> Image.Image:
+  ...
+
+
+@overload
+def embed_watermark_image(
+    image_input: Union[str, Image.Image],
+    output_path: Optional[str] = ...,
+    position: str = ...,
+    margin: int = ...,
+    scale: Optional[float] = ...,
+) -> Union[str, Image.Image]:
+  ...
 
 
 def embed_watermark_image(

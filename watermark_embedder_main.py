@@ -113,10 +113,10 @@ def main(argv: Sequence[str]) -> None:
   os.makedirs(resolved_output_dir, exist_ok=True)
   output_path = os.path.join(resolved_output_dir, output_filename)
 
-  logging.info('Embedding AI watermark...')
-  logging.info('Input path: %s', resolved_input_path)
-  logging.info('Output folder: %s', resolved_output_dir)
-  logging.info('Position: %s', _POSITION.value)
+  print('Embedding AI watermark...')
+  print(f'Input path: {resolved_input_path}')
+  print(f'Output folder: {resolved_output_dir}')
+  print(f'Position: {_POSITION.value}')
 
   try:
     if ext in _VIDEO_EXTENSIONS:
@@ -135,7 +135,7 @@ def main(argv: Sequence[str]) -> None:
           margin=_MARGIN.value,
           scale=_SCALE.value,
       )
-    logging.info('Successfully created AI watermarked file at: %s', result)
+    print(f'Successfully created AI watermarked file at: {result}')
 
   except (OSError, ValueError, RuntimeError) as e:
     logging.exception('Failed to process media path: %s', e)
