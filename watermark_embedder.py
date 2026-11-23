@@ -17,6 +17,8 @@
 Adds an AI watermark label to photos and videos based on Google UX specs.
 """
 
+from collections.abc import Mapping
+import dataclasses
 import os
 import tempfile
 from typing import Any, Optional, Union, overload
@@ -25,6 +27,7 @@ import ffmpeg
 from PIL import Image
 from PIL import ImageDraw
 from PIL import ImageFont
+from PIL import JpegImagePlugin
 
 # Supported file extensions
 _IMAGE_EXTENSIONS = frozenset(
@@ -33,6 +36,83 @@ _IMAGE_EXTENSIONS = frozenset(
 _VIDEO_EXTENSIONS = frozenset(
     {'.mp4', '.avi', '.mov', '.mkv', '.webm', '.flv', '.wmv'}
 )
+
+# High-fidelity default encoding parameters to prevent visible quality loss
+# when re-encoding after badge overlay.
+_DEFAULT_IMAGE_QUALITY = 95
+_DEFAULT_VIDEO_CRF = 16
+
+_METADATA_SUPPORTED_IMAGE_EXTS = frozenset(
+    {'.jpg', '.jpeg', '.png', '.webp', '.tiff'}
+)
+_DPI_SUPPORTED_IMAGE_EXTS = frozenset({'.jpg', '.jpeg', '.png', '.tiff'})
+_PRESERVED_IMAGE_INFO_KEYS = ('exif', 'icc_profile', 'dpi', 'xmp')
+_FASTSTART_VIDEO_EXTS = frozenset({'.mp4', '.mov'})
+_INVALID_COLOR_TAGS = frozenset({'', 'unknown', 'unspecified', 'reserved'})
+_NON_YUV_COLOR_SPACES = frozenset({'gbr', 'rgb'})
+_VIDEO_COLOR_TAG_MAP = (
+    ('color_space', 'colorspace'),
+    ('color_primaries', 'color_primaries'),
+    ('color_transfer', 'color_trc'),
+    ('color_range', 'color_range'),
+)
+
+
+@dataclasses.dataclass(frozen=True)
+class _VideoInfo:
+  """Probed video stream metadata.
+
+  Attributes:
+    width: Video frame width in pixels.
+    height: Video frame height in pixels.
+    has_audio: Whether the source video contains an audio stream.
+    color_tags: Tuple of validated `(ffmpeg_flag, value)` pairs for output color
+      metadata.
+  """
+
+  width: int
+  height: int
+  has_audio: bool
+  color_tags: tuple[tuple[str, str], ...] = ()
+
+
+def _extract_image_save_kwargs(
+    source_img: Image.Image,
+    output_ext: str,
+) -> Mapping[str, Any]:
+  """Builds format-aware Pillow save kwargs that preserve source quality."""
+  save_kwargs: dict[str, Any] = {}
+  info = source_img.info or {}
+
+  if output_ext in _METADATA_SUPPORTED_IMAGE_EXTS:
+    if info.get('exif'):
+      save_kwargs['exif'] = info['exif']
+    if info.get('icc_profile'):
+      save_kwargs['icc_profile'] = info['icc_profile']
+  if output_ext in _DPI_SUPPORTED_IMAGE_EXTS and info.get('dpi'):
+    save_kwargs['dpi'] = info['dpi']
+
+  if output_ext in ('.jpg', '.jpeg'):
+    if (
+        isinstance(source_img, JpegImagePlugin.JpegImageFile)
+        and 0 < len(source_img.quantization) < 5
+    ):
+      # Preserve exact source quantization tables and chroma subsampling.
+      save_kwargs['qtables'] = source_img.quantization
+      sampling = JpegImagePlugin.get_sampling(source_img)
+      if sampling in (0, 1, 2):
+        save_kwargs['subsampling'] = sampling
+    else:
+      save_kwargs['quality'] = _DEFAULT_IMAGE_QUALITY
+      save_kwargs['subsampling'] = 0
+    if info.get('progressive') or info.get('progression'):
+      save_kwargs['progressive'] = True
+  elif output_ext == '.webp':
+    if info.get('xmp'):
+      save_kwargs['xmp'] = info['xmp']
+    save_kwargs['quality'] = _DEFAULT_IMAGE_QUALITY
+
+  return save_kwargs
 
 
 def _get_watermark_font(font_size: int = 12) -> Any:
@@ -306,6 +386,10 @@ def embed_watermark_image(
   watermarked_img = (
       img_rgba.convert(orig_mode) if orig_mode != 'RGBA' else img_rgba
   )
+  source_info = image_input.info or {}
+  for key in _PRESERVED_IMAGE_INFO_KEYS:
+    if source_info.get(key):
+      watermarked_img.info[key] = source_info[key]
 
   if output_path:
     ext = os.path.splitext(output_path)[1].lower()
@@ -314,23 +398,37 @@ def embed_watermark_image(
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
     if ext in ('.jpg', '.jpeg') and watermarked_img.mode == 'RGBA':
       watermarked_img = watermarked_img.convert('RGB')
-    watermarked_img.save(output_path)
+    save_kwargs = _extract_image_save_kwargs(image_input, ext)
+    watermarked_img.save(output_path, **save_kwargs)
     return output_path
 
   return watermarked_img
 
 
-def _get_video_info(video_path: str) -> tuple[int, int, bool]:
-  """Probes video dimensions and audio presence using ffmpeg.probe.
+def _valid_color_tag(probe_key: str, value: Any) -> Optional[str]:
+  """Returns the color tag if valid for yuv420p output, or None otherwise."""
+  if not isinstance(value, str):
+    return None
+  normalized = value.lower()
+  if normalized in _INVALID_COLOR_TAGS:
+    return None
+  if probe_key == 'color_space' and normalized in _NON_YUV_COLOR_SPACES:
+    return None
+  return value
+
+
+def _get_video_info(video_path: str) -> _VideoInfo:
+  """Probes video dimensions, audio presence, and color metadata.
 
   Args:
     video_path: Path to the video file.
 
   Returns:
-    A tuple of (width, height, has_audio).
+    A `_VideoInfo` instance with dimensions, audio presence, and validated
+    FFmpeg color metadata tags.
 
   Raises:
-    ValueError: If unable to probe the video or determine its dimensions.
+    ValueError: If unable to probe the video or determine valid dimensions.
   """
   try:
     probe_data = ffmpeg.probe(video_path)
@@ -361,7 +459,35 @@ def _get_video_info(video_path: str) -> tuple[int, int, bool]:
     )
 
   has_audio = any(s.get('codec_type') == 'audio' for s in streams)
-  return width, height, has_audio
+  color_tags = tuple(
+      (ffmpeg_flag, tag)
+      for probe_key, ffmpeg_flag in _VIDEO_COLOR_TAG_MAP
+      if (tag := _valid_color_tag(probe_key, video_stream.get(probe_key)))
+  )
+  return _VideoInfo(
+      width=width,
+      height=height,
+      has_audio=has_audio,
+      color_tags=color_tags,
+  )
+
+
+def _build_video_output_kwargs(
+    video_info: _VideoInfo,
+    output_extension: str,
+) -> Mapping[str, Any]:
+  """Builds visually lossless FFmpeg encoding parameters."""
+  output_kwargs: dict[str, Any] = {
+      'vcodec': 'libx264',
+      'crf': _DEFAULT_VIDEO_CRF,
+      'pix_fmt': 'yuv420p',
+  }
+  if video_info.has_audio:
+    output_kwargs['acodec'] = 'copy'
+  if output_extension in _FASTSTART_VIDEO_EXTS:
+    output_kwargs['movflags'] = '+faststart'
+  output_kwargs.update(video_info.color_tags)
+  return output_kwargs
 
 
 def embed_watermark_video(
@@ -408,14 +534,14 @@ def embed_watermark_video(
     raise ValueError(f'Unsupported output video format: {output_extension}')
 
   os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
-  width, height, has_audio = _get_video_info(input_path)
+  video_info = _get_video_info(input_path)
 
-  calc_scale = _compute_scale_factor(width, height, scale)
+  calc_scale = _compute_scale_factor(video_info.width, video_info.height, scale)
   badge = _create_ai_watermark_badge(scale=calc_scale)
   margin_scaled = int(margin * calc_scale)
   x, y = _calculate_watermark_position(
-      width,
-      height,
+      video_info.width,
+      video_info.height,
       badge.width,
       badge.height,
       position=position,
@@ -429,23 +555,14 @@ def embed_watermark_video(
     video_input = ffmpeg.input(input_path)
     badge_input = ffmpeg.input(badge_path)
     overlaid_video = video_input.video.overlay(badge_input, x=x, y=y)
+    output_kwargs = _build_video_output_kwargs(video_info, output_extension)
 
-    if has_audio:
-      stream = ffmpeg.output(
-          overlaid_video,
-          video_input.audio,
-          output_path,
-          vcodec='libx264',
-          acodec='copy',
-          pix_fmt='yuv420p',
-      )
-    else:
-      stream = ffmpeg.output(
-          overlaid_video,
-          output_path,
-          vcodec='libx264',
-          pix_fmt='yuv420p',
-      )
+    output_streams = (
+        [overlaid_video, video_input.audio]
+        if video_info.has_audio
+        else [overlaid_video]
+    )
+    stream = ffmpeg.output(*output_streams, output_path, **output_kwargs)
 
     try:
       ffmpeg.run(stream, overwrite_output=True, quiet=True)
